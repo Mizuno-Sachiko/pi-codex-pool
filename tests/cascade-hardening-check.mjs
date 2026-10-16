@@ -3,6 +3,8 @@ import { accountKey, classifyFailure, retryAtFromText } from "../src/limits.mts"
 
 assert.equal(classifyFailure("HTTP 503 while contacting upstream").kind, "overload");
 assert.equal(classifyFailure("provider at capacity").kind, "overload");
+assert.equal(classifyFailure("Request failed", { error: { code: "server_busy" } }, 200).kind, "overload");
+assert.equal(classifyFailure("Request failed", { error: { code: "server_error" } }, 200).kind, "overload");
 assert.equal(classifyFailure("request id 14290 logged").kind, "other");
 assert.equal(classifyFailure("The usage limit has been reached").kind, "quota");
 assert.equal(classifyFailure("too many requests", { error: { code: "rate_limit_exceeded" } }, 429).kind, "rate");

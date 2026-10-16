@@ -685,12 +685,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				account,
 				kind: "missing-auth",
 				summary: "not logged in",
-				details: [
-					`account: ${account.displayName}`,
-					`provider: ${account.providerName}`,
-					"status: not logged in",
-					"login: use /subs login or /login to authenticate this account",
-				],
+				details: ["status: not logged in", "login: use /subs login or /login to authenticate this account"],
 				score: 0,
 			};
 		}
@@ -722,12 +717,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 					account,
 					kind: "error",
 					summary: error,
-					details: [
-						`account: ${account.displayName}`,
-						`provider: ${account.providerName}`,
-						`status: error`,
-						`details: ${error}`,
-					],
+					details: ["status: error", `details: ${error}`],
 					score: 0,
 				};
 			}
@@ -747,19 +737,13 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
 				formatQuotaKind(classification.kind),
 			].join(" | ");
-			const details = [
-				`account: ${account.displayName}`,
-				`provider: ${account.providerName}`,
-				`status: ${formatQuotaKind(classification.kind)}`,
-				`plan: ${snapshot.planType}`,
-			];
+			const details = [`status: ${formatQuotaKind(classification.kind)}`, `plan: ${snapshot.planType}`];
 			if (snapshot.email) {
 				details.push(`email: ${snapshot.email}`);
 			}
 			details.push(
 				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
 				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
-				`endpoint: ${baseUrl}/wham/usage`,
 			);
 			return {
 				account,
@@ -776,12 +760,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				account,
 				kind: "error",
 				summary: message,
-				details: [
-					`account: ${account.displayName}`,
-					`provider: ${account.providerName}`,
-					"status: error",
-					`details: ${message}`,
-				],
+				details: ["status: error", `details: ${message}`],
 				score: 0,
 			};
 		}
@@ -793,7 +772,6 @@ const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [codexQuotaChecker];
 async function showQuotaDetails(ctx: ExtensionCommandContext, result: QuotaCheckResult): Promise<void> {
 	await showWrappedSelect(ctx, {
 		title: `Limit Details: ${result.account.displayName}`,
-		subtitle: "Press Enter or Escape to go back to the limits list.",
 		items: result.details.map((detail, index) => ({ value: `${index}:${detail}`, label: detail })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -1211,7 +1189,7 @@ class PoolManager {
 	getAvailableMembers(pool: PoolConfig, authStorage: { hasAuth(provider: string): boolean }): string[] {
 		const state = getSharedPoolState().snapshot();
 		const now = Date.now();
-		return pool.members.filter((member) => {
+		const available = pool.members.filter((member) => {
 			if (!authStorage.hasAuth(member)) return false;
 			try {
 				return unavailableUntil(state.accounts[getMember(member).key], now) <= now;
@@ -1219,13 +1197,7 @@ class PoolManager {
 				return false;
 			} // The status view reports invalid credentials per account.
 		});
-	}
-
-	isMemberExhausted(pool: PoolConfig, provider: string): boolean {
-		return (
-			pool.members.includes(provider) &&
-			unavailableUntil(getSharedPoolState().snapshot().accounts[getMember(provider).key]) > Date.now()
-		);
+		return pool.strategy === "scheduled" ? getScheduledMemberOrder(pool, available, new Date(now)) : available;
 	}
 }
 
@@ -1237,24 +1209,12 @@ function getSubscriptionSource(config: MultiPassConfig, entry: SubEntry): "confi
 	return config.subscriptions.find((s) => s.provider === entry.provider && s.index === entry.index) ? "config" : "env";
 }
 
-function formatSubscriptionMeta(
-	entry: SubEntry,
-	config: MultiPassConfig,
-	authStorage: { hasAuth(provider: string): boolean },
-): string {
-	const name = subProviderName(entry);
-	const hasAuth = authStorage.hasAuth(name);
-	const status = hasAuth ? "[logged in]" : "[not logged in]";
-	const source = getSubscriptionSource(config, entry);
-	return `${status} (${source})`;
+function formatSubscriptionMeta(entry: SubEntry, authStorage: { hasAuth(provider: string): boolean }): string {
+	return authStorage.hasAuth(subProviderName(entry)) ? "logged in" : "not logged in";
 }
 
-function formatSubscriptionListLine(
-	entry: SubEntry,
-	config: MultiPassConfig,
-	authStorage: { hasAuth(provider: string): boolean },
-): string {
-	return `${subDisplayName(entry)} -- ${formatSubscriptionMeta(entry, config, authStorage)}`;
+function formatSubscriptionListLine(entry: SubEntry, authStorage: { hasAuth(provider: string): boolean }): string {
+	return `${subDisplayName(entry)} · ${formatSubscriptionMeta(entry, authStorage)}`;
 }
 
 function getSwitchableProviderOptions(
@@ -1410,7 +1370,7 @@ async function showSubscriptionActions(
 			items: [
 				{
 					value: subProviderName(entry),
-					label: formatSubscriptionListLine(entry, config, getAuthStorage(ctx)),
+					label: formatSubscriptionListLine(entry, getAuthStorage(ctx)),
 				},
 			],
 			confirmHint: "back",
@@ -1431,7 +1391,6 @@ async function showSubscriptionActions(
 
 	const action = await showWrappedSelect(ctx, {
 		title: subDisplayName(entry),
-		subtitle: "Escape returns to the subscriptions list.",
 		items: actionItems,
 		confirmHint: "open",
 		cancelHint: "back",
@@ -1475,7 +1434,7 @@ async function handleSubsList(pi: ExtensionAPI, ctx: ExtensionCommandContext, po
 			items: all.map((entry) => ({
 				value: subProviderName(entry),
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
+				description: formatSubscriptionMeta(entry, getAuthStorage(ctx)),
 			})),
 			initialValue: preferredProviderName,
 			confirmHint: "open",
@@ -1671,39 +1630,14 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const lines: string[] = [];
 	for (const entry of all) {
 		const name = subProviderName(entry);
-		const cred = getAuthStorage(ctx).get(name);
-		const hasAuth = getAuthStorage(ctx).hasAuth(name);
-
-		let status: string;
-		if (!hasAuth) {
-			status = "not logged in";
-		} else if (cred?.type === "oauth") {
-			const expiresIn = typeof cred.expires === "number" ? cred.expires - Date.now() : 0;
-			if (expiresIn > 0) {
-				const mins = Math.round(expiresIn / 60000);
-				status = `logged in (expires ${mins}m)`;
-			} else {
-				status = "logged in (token expired, will refresh)";
-			}
-		} else {
-			status = "logged in (api key)";
-		}
-
-		const modelCount = getCodexModels().length;
-		const source = config.subscriptions.find((s) => s.provider === entry.provider && s.index === entry.index)
-			? "saved"
-			: "env";
-
-		// Check if in any pool
-		const inPools = config.pools.filter((p) => p.members.includes(name)).map((p) => p.name);
-		const poolInfo = inPools.length > 0 ? ` | pools: ${inPools.join(", ")}` : "";
-
-		lines.push(`${subDisplayName(entry)} | ${status} | ${modelCount} models | ${source}${poolInfo}`);
+		const status = formatSubscriptionMeta(entry, getAuthStorage(ctx));
+		const inPools = config.pools.filter((pool) => pool.members.includes(name)).map((pool) => pool.name);
+		const poolInfo = inPools.length > 0 ? ` · ${inPools.join(", ")}` : "";
+		lines.push(`${subDisplayName(entry)} · ${status}${poolInfo}`);
 	}
 
 	await showWrappedSelect(ctx, {
 		title: "Subscription Status",
-		subtitle: "Press Enter or Escape to go back.",
 		items: lines.map((line, index) => ({ value: `${index}:${line}`, label: line })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -2168,15 +2102,10 @@ async function handlePoolCreate(ctx: ExtensionCommandContext, poolManager: PoolM
 	await createAndPersistPool(ctx, poolManager, { allowOverwrite: true });
 }
 
-async function inspectPoolConfig(
-	ctx: ExtensionCommandContext,
-	pool: PoolConfig,
-	poolManager: PoolManager,
-): Promise<void> {
+async function inspectPoolConfig(ctx: ExtensionCommandContext, pool: PoolConfig): Promise<void> {
 	await showWrappedSelect(ctx, {
 		title: `Pool Status: ${pool.name}`,
-		subtitle: "Press Enter or Escape to go back to the pools list.",
-		items: formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager).map((line, index) => ({
+		items: formatPoolStatusLines(pool, getAuthStorage(ctx)).map((line, index) => ({
 			value: `${index}:${line}`,
 			label: line,
 		})),
@@ -2276,7 +2205,6 @@ async function showPoolActions(
 	const currentStrategy = pool.strategy || "round-robin";
 	const action = await showWrappedSelect(ctx, {
 		title: pool.name,
-		subtitle: "Escape returns to the pools list.",
 		items: [
 			{ value: "models", label: "models", description: "Choose a model from this pool" },
 			{ value: "inspect", label: "inspect", description: "View pool health and member status" },
@@ -2304,7 +2232,7 @@ async function showPoolActions(
 		return undefined;
 	}
 	if (action === "inspect") {
-		await inspectPoolConfig(ctx, pool, poolManager);
+		await inspectPoolConfig(ctx, pool);
 		return undefined;
 	}
 	if (action === "rename") {
@@ -2407,138 +2335,54 @@ async function handlePoolRemove(ctx: ExtensionCommandContext, poolManager: PoolM
 	await removePoolConfig(ctx, poolManager, config, config.pools[idx]);
 }
 
-function summarizePoolHealth(
-	pool: PoolConfig,
-	authStorage: { hasAuth(provider: string): boolean },
-	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
-): {
-	availableCount: number;
-	authedCount: number;
-	memberCount: number;
-	unavailableCount: number;
-	statusLabel: string;
-} {
-	const availableMembers = pool.enabled ? poolManager.getAvailableMembers(pool, authStorage) : [];
-	let authedCount = 0;
-	for (const member of pool.members) {
-		if (authStorage.hasAuth(member)) authedCount += 1;
-	}
-	const availableCount = availableMembers.length;
-	const memberCount = pool.members.length;
-	const unavailableCount = memberCount - availableCount;
-	let statusLabel = `${availableCount}/${memberCount} available`;
-	if (!pool.enabled) {
-		statusLabel += " | pool disabled";
-	} else if (memberCount === 0) {
-		statusLabel += " | no members configured";
-	} else if (availableCount === 0) {
-		if (authedCount === 0) {
-			statusLabel += " | no auth";
-		} else {
-			statusLabel += " | cooldown/no eligible members";
-		}
-	}
-	return {
-		availableCount,
-		authedCount,
-		memberCount,
-		unavailableCount,
-		statusLabel,
-	};
-}
-
 function formatPoolListDescription(
 	pool: PoolConfig,
 	authStorage: { hasAuth(provider: string): boolean },
-	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	poolManager: Pick<PoolManager, "getAvailableMembers">,
 ): string {
-	const summary = summarizePoolHealth(pool, authStorage, poolManager);
-	const status = pool.enabled ? "enabled" : "disabled";
-	return `${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
+	const available = pool.enabled ? poolManager.getAvailableMembers(pool, authStorage).length : 0;
+	return `${pool.strategy || "round-robin"} · ${pool.enabled ? "enabled" : "disabled"} · ${available}/${pool.members.length} available`;
 }
 
-function formatPoolStatusLines(
-	pool: PoolConfig,
-	authStorage: { hasAuth(provider: string): boolean },
-	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
-): string[] {
-	const summary = summarizePoolHealth(pool, authStorage, poolManager);
-	const strategy = pool.strategy || "round-robin";
-	const lines = [
-		`=== ${pool.name} (${pool.enabled ? "enabled" : "disabled"}) ===`,
-		`provider: ${pool.name}`,
-		`models: ${getSelectableModelsForPool(pool).length}`,
-		`strategy: ${strategy}`,
-		`members: ${summary.memberCount}`,
-		`availability: ${summary.statusLabel}`,
-	];
-	if (pool.selectorScript) {
-		lines.push(`selector: ${pool.selectorScript}`);
-	}
-	if (pool.members.length === 0) {
-		lines.push("  [no members configured]");
-		return lines;
-	}
-	const memberSchedule = pool.memberSchedule || {};
+function formatPoolStatusLines(pool: PoolConfig, authStorage: { hasAuth(provider: string): boolean }): string[] {
 	const shared = getSharedPoolState().snapshot();
-	const identities = new Map<string, Member>();
-	for (const member of pool.members) {
-		try {
-			identities.set(member, getMember(member));
-		} catch {
-			lines.push(`  ${member} -- invalid credential; use /subs login`);
-		}
-	}
-	const memberKeys = new Set([...identities.values()].map((member) => member.key));
-	const waiting = Object.values(shared.waiters ?? {}).filter((request) =>
-		request.keys.some((key) => memberKeys.has(key)),
-	).length;
-	lines.push(`waiting requests: ${waiting}`);
 	const limit = loadGlobalConfig().maxConcurrentPerAccount ?? 2;
+	const now = new Date();
+	const lines: string[] = [];
+	let available = 0;
 	for (const member of pool.members) {
-		const identity = identities.get(member);
-		if (!identity) continue;
-		const authed = authStorage.hasAuth(member);
-		const exhausted = pool.enabled && authed && poolManager.isMemberExhausted(pool, member);
-		let status = authed ? "logged in" : "not logged in";
-		if (exhausted) status += " (rate limited, cooling down)";
-		if (pool.enabled && authed && !exhausted) status += " (available)";
-		if (!pool.enabled && authed) status += " (pool disabled)";
-
-		const schedule = memberSchedule[member];
-		if (schedule) {
-			const role = schedule.role || "default";
-			status += ` [${role}]`;
-			if (schedule.windows && schedule.windows.length > 0) {
-				const now = new Date();
-				const state = getScheduledMemberState(member, schedule, now);
-				status += state.active ? " (in window)" : " (outside window)";
-			}
+		if (!authStorage.hasAuth(member)) {
+			lines.push(`  ${member} · not logged in`);
+			continue;
 		}
-
-		const key = identity.key;
-		const account = shared.accounts[key];
-		lines.push(`  ${member} -- ${status} | requests ${activeRequests(shared, key)}/${limit}`);
-		if (account?.quota) {
-			lines.push(`    quota: ${account.quota.summary} | checked ${new Date(account.quota.checkedAt).toISOString()}`);
-			if (account.quota.kind === "error" && account.lastSuccessfulCheckAt) {
-				lines.push(`    last successful quota check: ${new Date(account.lastSuccessfulCheckAt).toISOString()}`);
-			}
-		} else {
-			lines.push("    quota: unknown (use /subs limits)");
+		let identity: Member;
+		try {
+			identity = getMember(member);
+		} catch {
+			lines.push(`  ${member} · invalid credential; use /subs login`);
+			continue;
 		}
-		if (account?.cooldownUntil && account.cooldownUntil > Date.now()) {
-			lines.push(`    request cooldown until ${new Date(account.cooldownUntil).toISOString()}`);
-		}
-		if (account?.blockedUntil && account.blockedUntil > Date.now()) {
-			lines.push(`    quota unavailable until ${new Date(account.blockedUntil).toISOString()}`);
-		}
-		if (account?.failure) lines.push(`    last rejection: ${account.failure}`);
+		let status = "available";
+		const schedule = pool.memberSchedule?.[member];
+		if (!pool.enabled) status = "pool disabled";
+		else if (unavailableUntil(shared.accounts[identity.key], now.getTime()) > now.getTime()) status = "cooling down";
+		else if (
+			pool.strategy === "scheduled" &&
+			schedule?.role === "preferred" &&
+			!getScheduledMemberState(member, schedule, now).active
+		)
+			status = "outside schedule";
+		else available++;
+		lines.push(`  ${member} · ${status} · ${activeRequests(shared, identity.key)}/${limit}`);
 	}
-	return lines;
+	const strategy = pool.strategy || "round-robin";
+	return [
+		`${pool.name} · ${pool.enabled ? "enabled" : "disabled"} · ${strategy} · ${available}/${pool.members.length} available`,
+		...lines,
+	];
 }
 
-async function handlePoolStatus(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
+async function handlePoolStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	if (config.pools.length === 0) {
 		ctx.ui.notify("No pools configured.", "info");
@@ -2547,7 +2391,7 @@ async function handlePoolStatus(ctx: ExtensionCommandContext, poolManager: PoolM
 
 	const lines: string[] = [];
 	for (const pool of config.pools) {
-		lines.push(...formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager));
+		lines.push(...formatPoolStatusLines(pool, getAuthStorage(ctx)));
 	}
 
 	await ctx.ui.select("Pool Status", lines);
@@ -2579,44 +2423,14 @@ function formatChainEntryStatus(
 	entry: ChainEntryConfig,
 	config?: MultiPassConfig,
 	authStorage?: { hasAuth(provider: string): boolean },
-	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	poolManager?: Pick<PoolManager, "getAvailableMembers">,
 ): string {
-	const entryState = entry.enabled ? "enabled" : "disabled";
-	const issue = config ? getChainEntryIssue(entry, config) : null;
-	let healthSuffix = "";
-	if (config && authStorage && poolManager) {
+	let status = entry.enabled ? (config ? getChainEntryIssue(entry, config) : null) : "disabled";
+	if (!status && config && authStorage && poolManager) {
 		const pool = config.pools.find((candidate) => candidate.name === entry.pool);
-		if (pool) {
-			const summary = summarizePoolHealth(pool, authStorage, poolManager);
-			healthSuffix = ` | pool ${pool.enabled ? "enabled" : "disabled"} | ${summary.availableCount}/${summary.memberCount} available | ${summary.authedCount} authed`;
-		}
+		if (pool && poolManager.getAvailableMembers(pool, authStorage).length === 0) status = "no available accounts";
 	}
-	const issueSuffix = issue ? ` | ${issue} | skipped` : "";
-	return `${entry.pool} -> ${entry.model} (${entryState}${healthSuffix}${issueSuffix})`;
-}
-
-function formatChainListLine(
-	chain: ChainConfig,
-	config?: MultiPassConfig,
-	authStorage?: { hasAuth(provider: string): boolean },
-	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
-): string {
-	const entryLabel = chain.entries.length === 1 ? "entry" : "entries";
-	const invalidEntries = config ? chain.entries.filter((entry) => getChainEntryIssue(entry, config)).length : 0;
-	let usableEntries = 0;
-	if (config && authStorage && poolManager) {
-		usableEntries = chain.entries.filter((entry) => {
-			if (!entry.enabled) return false;
-			if (getChainEntryIssue(entry, config)) return false;
-			const pool = config.pools.find((candidate) => candidate.name === entry.pool);
-			if (!pool?.enabled) return false;
-			return summarizePoolHealth(pool, authStorage, poolManager).availableCount > 0;
-		}).length;
-	}
-	const issueLabel = invalidEntries > 0 ? ` | ${invalidEntries} invalid` : "";
-	const usableLabel =
-		config && authStorage && poolManager ? ` | ${usableEntries}/${chain.entries.length} usable now` : "";
-	return `${chain.name} | ${chain.entries.length} ${entryLabel} | ${chain.enabled ? "enabled" : "disabled"}${issueLabel}${usableLabel}`;
+	return `${entry.pool} -> ${entry.model}${status ? ` (${status})` : ""}`;
 }
 
 function formatChainToggleOption(chain: ChainConfig): string {
@@ -2632,32 +2446,9 @@ function formatChainStatusLines(
 	chain: ChainConfig,
 	config?: MultiPassConfig,
 	authStorage?: { hasAuth(provider: string): boolean },
-	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	poolManager?: Pick<PoolManager, "getAvailableMembers">,
 ): string[] {
-	const invalidEntries = config ? chain.entries.filter((entry) => getChainEntryIssue(entry, config)).length : 0;
-	const usableEntries =
-		config && authStorage && poolManager
-			? chain.entries.filter((entry) => {
-					if (!entry.enabled) return false;
-					if (getChainEntryIssue(entry, config)) return false;
-					const pool = config.pools.find((candidate) => candidate.name === entry.pool);
-					if (!pool?.enabled) return false;
-					return summarizePoolHealth(pool, authStorage, poolManager).availableCount > 0;
-				}).length
-			: undefined;
-	const lines = [
-		`=== ${chain.name} (${chain.enabled ? "enabled" : "disabled"}) ===`,
-		`entries: ${chain.entries.length}`,
-		`chain state: ${chain.enabled ? "active" : "disabled (all entries skipped)"}`,
-	];
-
-	if (usableEntries !== undefined) {
-		lines.push(`usable entries now: ${usableEntries}/${chain.entries.length}`);
-	}
-
-	if (invalidEntries > 0) {
-		lines.push(`invalid entries: ${invalidEntries} (skipped until fixed)`);
-	}
+	const lines = [`${chain.name} · ${chain.enabled ? "enabled" : "disabled"}`];
 
 	if (chain.entries.length === 0) {
 		lines.push("  [no entries configured]");
@@ -2775,19 +2566,6 @@ async function handlePoolChainCreate(ctx: ExtensionCommandContext, poolManager: 
 	);
 }
 
-async function handlePoolChainList(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
-	const config = loadGlobalConfig();
-	if (config.chains.length === 0) {
-		ctx.ui.notify("No chains configured. Use /pool chain to create one.", "info");
-		return;
-	}
-
-	await ctx.ui.select(
-		"Chains",
-		config.chains.map((chain) => formatChainListLine(chain, config, getAuthStorage(ctx), poolManager)),
-	);
-}
-
 async function handlePoolChainToggle(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	if (config.chains.length === 0) {
@@ -2834,7 +2612,7 @@ async function handlePoolChainRemove(ctx: ExtensionCommandContext): Promise<void
 	ctx.ui.notify(`Removed chain "${chain.name}"`, "info");
 }
 
-async function handlePoolChainStatus(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
+async function handlePoolChainList(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
 	const config = loadGlobalConfig();
 	if (config.chains.length === 0) {
 		ctx.ui.notify("No chains configured.", "info");
@@ -2842,11 +2620,11 @@ async function handlePoolChainStatus(ctx: ExtensionCommandContext, poolManager: 
 	}
 
 	const selected = await showWrappedSelect(ctx, {
-		title: "Chain Status",
+		title: "Chains",
 		items: config.chains.map((chain) => ({
 			value: chain.name,
 			label: chain.name,
-			description: "inspect chain entries",
+			description: chain.enabled ? "enabled" : "disabled",
 		})),
 		confirmHint: "inspect",
 		cancelHint: "back",
@@ -2859,19 +2637,15 @@ async function handlePoolChainStatus(ctx: ExtensionCommandContext, poolManager: 
 		return;
 	}
 
-	await ctx.ui.select(
-		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
-	);
+	await ctx.ui.select(`Chain: ${chain.name}`, formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager));
 }
 
 async function handlePoolChainMenu(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
 	const actions = [
 		"create   -- Create a new fallback chain",
-		"list     -- Show all chains",
+		"list     -- Show chains and their entries",
 		"toggle   -- Enable/disable a chain",
 		"remove   -- Remove a chain",
-		"status   -- Inspect ordered chain entries",
 	];
 
 	const selected = await ctx.ui.select("Chain Manager", actions);
@@ -2887,8 +2661,6 @@ async function handlePoolChainMenu(ctx: ExtensionCommandContext, poolManager: Po
 			return handlePoolChainToggle(ctx);
 		case "remove":
 			return handlePoolChainRemove(ctx);
-		case "status":
-			return handlePoolChainStatus(ctx, poolManager);
 	}
 }
 
@@ -3127,9 +2899,6 @@ async function handlePoolMenu(ctx: ExtensionCommandContext, poolManager: PoolMan
 		"create   -- Create a new rotation pool",
 		"list     -- Show pools and quick actions",
 		"chain    -- Manage saved fallback chains",
-		"toggle   -- Enable/disable a pool",
-		"remove   -- Remove a pool",
-		"status   -- Detailed pool status with member health",
 		"project  -- Project-level pool config (.pi/multi-pass.json)",
 	];
 
@@ -3144,12 +2913,6 @@ async function handlePoolMenu(ctx: ExtensionCommandContext, poolManager: PoolMan
 			return handlePoolList(ctx, poolManager);
 		case "chain":
 			return handlePoolChainMenu(ctx, poolManager);
-		case "toggle":
-			return handlePoolToggle(ctx, poolManager);
-		case "remove":
-			return handlePoolRemove(ctx, poolManager);
-		case "status":
-			return handlePoolStatus(ctx, poolManager);
 		case "project":
 			return handlePoolProject(ctx, poolManager);
 	}
@@ -3163,12 +2926,9 @@ async function handleSubsMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext, po
 	const actions: SelectItem[] = [
 		{ value: "list", label: "list", description: "Show all extra subscriptions" },
 		{ value: "add", label: "add", description: "Add a new subscription" },
-		{ value: "remove", label: "remove", description: "Remove a subscription" },
-		{ value: "login", label: "login", description: "Login to a subscription" },
-		{ value: "logout", label: "logout", description: "Logout from a subscription" },
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
-		{ value: "status", label: "status", description: "Show auth status and token info" },
-		{ value: "limits", label: "limits", description: "Check built-in Codex quota support" },
+		{ value: "status", label: "status", description: "Show login status and pool membership" },
+		{ value: "limits", label: "limits", description: "Check subscription quotas" },
 	];
 	let preferredAction = "list";
 
@@ -3189,15 +2949,6 @@ async function handleSubsMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext, po
 				break;
 			case "add":
 				await handleSubsAdd(pi, ctx, poolManager);
-				break;
-			case "remove":
-				await handleSubsRemove(pi, ctx, poolManager);
-				break;
-			case "login":
-				await handleSubsLogin(ctx);
-				break;
-			case "logout":
-				await handleSubsLogout(ctx);
 				break;
 			case "switch":
 				await handleSubsSwitch(pi, ctx);
@@ -3715,7 +3466,7 @@ export default async function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainRemove(ctx);
 						case "status":
 						case "info":
-							return handlePoolChainStatus(ctx, poolManager);
+							return handlePoolChainList(ctx, poolManager);
 						case "create":
 						case "new":
 							return handlePoolChainCreate(ctx, poolManager);
@@ -3730,7 +3481,7 @@ export default async function multiSub(pi: ExtensionAPI) {
 					return handlePoolRemove(ctx, poolManager);
 				case "status":
 				case "info":
-					return handlePoolStatus(ctx, poolManager);
+					return handlePoolStatus(ctx);
 				case "limits":
 					return handleSubsLimits(ctx);
 				case "models": {

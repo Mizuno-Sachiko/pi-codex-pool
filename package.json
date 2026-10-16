@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-pool",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension for multiple ChatGPT Codex accounts and selectable account-pool models",
   "keywords": [
     "pi-package",

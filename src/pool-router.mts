@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as wait } from "node:timers/promises";
 import type {
 	Api,
@@ -14,6 +14,7 @@ import type {
 import {
 	appendAssistantMessageDiagnostic,
 	createAssistantMessageEventStream,
+	isRetryableAssistantError,
 	registerSessionResourceCleanup,
 } from "@earendil-works/pi-ai";
 import { accountKey, classifyFailure, record } from "./limits.mts";
@@ -170,8 +171,8 @@ function poolFailure(
 			},
 		],
 		errorMessage: partial
-			? "Pool response interrupted after partial output; retry manually. Details: /pool status."
-			: `Pool stopped after ${attempts} account attempts (${kind}); inspect /pool status or /subs limits.`,
+			? "Pool response interrupted after partial output; retry manually."
+			: `Pool stopped after ${attempts} account attempts (${kind}); check ${kind === "auth" ? "/subs login" : "/subs limits"}.`,
 	};
 }
 
@@ -184,11 +185,40 @@ function mergeHeaders(...sources: (ProviderHeaders | undefined)[]): ProviderHead
 	);
 }
 
+interface RetryRoute {
+	requestKey: string;
+	pool: string;
+	model: string;
+	member: Member;
+	dispose?(): void;
+}
+
 export class PoolRouter {
 	private dependencies: RouterDependencies;
+	private retries = new Map<string, RetryRoute>();
+	private unregisterCleanup?: () => void;
 
 	constructor(dependencies: RouterDependencies) {
 		this.dependencies = dependencies;
+	}
+
+	private setRetry(sessionId: string | undefined, route?: RetryRoute): void {
+		if (sessionId === undefined) {
+			for (const retained of this.retries.values()) retained.dispose?.();
+			this.retries.clear();
+		} else {
+			this.retries.get(sessionId)?.dispose?.();
+			if (route) {
+				this.retries.set(sessionId, route);
+				this.unregisterCleanup ??= registerSessionResourceCleanup((id) => this.setRetry(id));
+			} else {
+				this.retries.delete(sessionId);
+			}
+		}
+		if (!this.retries.size) {
+			this.unregisterCleanup?.();
+			this.unregisterCleanup = undefined;
+		}
 	}
 
 	stream: ProviderStreams["stream"] = (model, context, options) => this.request(model, context, options, false);
@@ -220,6 +250,22 @@ export class PoolRouter {
 			let lastError: AssistantMessage | undefined;
 			let lastFailure = "auth";
 			let waiting = false;
+			let route: Omit<RetryRoute, "requestKey" | "dispose"> | undefined;
+			let contextKey: string | undefined;
+			// Pi omits failed attempts before retrying; retain only a digest of that request's context.
+			const requestKey = () =>
+				(contextKey ??= createHash("sha256")
+					.update(
+						JSON.stringify([
+							model.provider,
+							model.id,
+							context.messages.filter(
+								(message) =>
+									message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted"),
+							),
+						]),
+					)
+					.digest("hex"));
 			const cleanupErrors: string[] = [];
 			const invalid = new Set<string>();
 			const memberFor = (provider: string): Member | undefined => {
@@ -261,6 +307,21 @@ export class PoolRouter {
 			const finish = (event: Extract<AssistantMessageEvent, { type: "done" | "error" }>) => {
 				release();
 				const message = event.type === "done" ? event.message : event.error;
+				const sessionId = options?.sessionId;
+				if (sessionId) {
+					if (route && event.type === "error" && !signal.aborted && isRetryableAssistantError(message)) {
+						const onAbort = () => this.setRetry(sessionId);
+						signal.addEventListener("abort", onAbort, { once: true });
+						this.setRetry(sessionId, {
+							...route,
+							requestKey: requestKey(),
+							dispose: () => signal.removeEventListener("abort", onAbort),
+						});
+					} else {
+						const retained = this.retries.get(sessionId);
+						if (retained && retained.requestKey === requestKey()) this.setRetry(sessionId);
+					}
+				}
 				if (cleanupErrors.length) {
 					appendAssistantMessageDiagnostic(message, {
 						type: "pool_cleanup_failure",
@@ -309,6 +370,9 @@ export class PoolRouter {
 					}
 				}
 				const previous = previousResponse(context);
+				const pending = options?.sessionId ? this.retries.get(options.sessionId) : undefined;
+				let retained = pending && pending.requestKey === requestKey() ? pending : undefined;
+				if (pending && !retained && options?.sessionId) this.setRetry(options.sessionId);
 				const user = context.messages.findLast((message) => message.role === "user");
 				const prompt =
 					typeof user?.content === "string"
@@ -317,17 +381,19 @@ export class PoolRouter {
 								.filter((content) => content.type === "text")
 								.map((content) => content.text)
 								.join("\n");
-				if (pool && previous) {
-					const route = previous.diagnostics?.findLast(
+				if (pool && (retained || previous)) {
+					const previousPool = previous?.diagnostics?.findLast(
 						(entry) => entry.type === "pool_route" && entry.details?.source === pool.name,
-					)?.details;
-					const position = targets.findIndex(
-						(target) =>
-							target.model === previous.model &&
-							target.pool.members.includes(previous.provider) &&
-							(!route || target.pool.name === route.pool),
+					)?.details?.pool;
+					const position = targets.findIndex((target) =>
+						retained
+							? target.pool.name === retained.pool && target.model === retained.model
+							: target.model === previous?.model &&
+								target.pool.members.includes(previous.provider) &&
+								(!previousPool || target.pool.name === previousPool),
 					);
 					if (position > 0) targets.splice(0, position);
+					if (position < 0) retained = undefined;
 				}
 				const scopedHeaders = new Set(pool ? deps.headerNames(model) : []);
 				// Configured source fields belong to that pool, even if a caller supplied the same name.
@@ -376,11 +442,15 @@ export class PoolRouter {
 						const snapshot = state.snapshot();
 						const sticky =
 							attempts === 0 &&
-							previous?.model === target.model &&
-							members.find(
-								(member) =>
-									member.provider === previous.provider && unavailableUntil(snapshot.accounts[member.key], now) <= now,
-							);
+							members.find((member) => {
+								const matches = retained
+									? target.pool.name === retained.pool &&
+										target.model === retained.model &&
+										member.provider === retained.member.provider &&
+										member.key === retained.member.key
+									: previous?.model === target.model && member.provider === previous.provider;
+								return matches && unavailableUntil(snapshot.accounts[member.key], now) <= now;
+							});
 						if (sticky) members = [sticky];
 						const ordered = Boolean(sticky) || ordering.ordered;
 						lease = state.reserve(
@@ -502,6 +572,12 @@ export class PoolRouter {
 							},
 						};
 						const startedAt = Date.now();
+						if (pool)
+							route = {
+								pool: livePool.name,
+								model: target.model,
+								member: { provider: reservation.provider, key: reservation.key },
+							};
 						const transport = (simple ? deps.transport.streamSimple : deps.transport.stream)(
 							currentModel,
 							context,
@@ -527,12 +603,17 @@ export class PoolRouter {
 								lastError = event.error;
 								const failure = classifyFailure(event.error.errorMessage ?? "", raw, status, headers);
 								lastFailure = failure.kind;
-								if (event.reason !== "aborted" && failure.kind !== "other") {
+								if (event.reason !== "aborted" && failure.kind === "overload") {
+									// Service-wide failures use Pi's visible backoff without penalizing this account.
+									event.error.errorMessage = `Service temporarily unavailable: ${failure.message}`;
+								}
+								const accountFailure = failure.kind === "quota" || failure.kind === "rate" || failure.kind === "auth";
+								if (event.reason !== "aborted" && accountFailure) {
 									const time = Date.now();
 									state.fail(
 										reservation.key,
 										failure.message.slice(0, 1000),
-										failure.requestRetryAt ?? time + (failure.kind === "overload" ? 5000 : 30_000),
+										failure.requestRetryAt ?? time + 30_000,
 										failure.kind === "quota" ? failure.retryAt : undefined,
 									);
 									if (!refreshed && (failure.kind === "quota" || failure.kind === "rate")) {
@@ -546,7 +627,7 @@ export class PoolRouter {
 									started = undefined;
 									break;
 								}
-								if (pool && event.reason !== "aborted" && (emitted || failure.kind !== "other")) {
+								if (pool && event.reason !== "aborted" && accountFailure) {
 									event.error = poolFailure(event.error, pool.name, attempts, failure.kind, emitted);
 								}
 							}

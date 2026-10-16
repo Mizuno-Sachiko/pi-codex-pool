@@ -48,6 +48,8 @@ The default `round-robin` strategy prefers accounts with fewer concurrent reques
 
 Tool execution does not occupy a concurrency slot. Follow-up model requests try to keep the same account.
 
+Quota and rate-limit errors can switch accounts. Service overloads keep the selected account and use Pi's global retry settings.
+
 Use these commands to inspect and adjust a pool:
 
 ```text

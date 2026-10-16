@@ -70,6 +70,8 @@ export function classifyFailure(
 	else if (code === "rate_limit_exceeded" || code === "too_many_requests") kind = "rate";
 	else if (code === "context_length_exceeded" || code === "context_window_exceeded") kind = "other";
 	else if (
+		code === "server_busy" ||
+		code === "server_error" ||
 		(status !== undefined && status >= 500 && status <= 599) ||
 		(!code && status === undefined && /overloaded|at capacity|\bHTTP\s+5\d{2}\b/i.test(original))
 	)

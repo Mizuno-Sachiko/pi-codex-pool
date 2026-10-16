@@ -88,6 +88,8 @@ try {
 	assert.deepEqual(loaded.errors, []);
 	const extension = loaded.extensions[0];
 	const runtime = await ModelRuntime.create({ allowModelNetwork: false });
+	const aiPackage = findPackageJSON("@earendil-works/pi-ai", join(piPackage, "package.json"));
+	const { isRetryableAssistantError, retryAssistantCall } = createRequire(aiPackage)("./dist/utils/retry.js");
 	function applyRegistrations(target) {
 		for (const entry of loaded.runtime.pendingProviderRegistrations) target.registerProvider(entry.name, entry.config);
 		for (const entry of loaded.runtime.pendingNativeProviderRegistrations)
@@ -316,6 +318,25 @@ try {
 	assert.equal(originalScope.provider, names[0], "an inherited provider must retain its original project scope");
 	await emit("session_start", {});
 
+	const busyContext = input();
+	const busyAccounts = [];
+	const recoveredBusy = await retryAssistantCall(
+		() =>
+			request(structuredClone(busyContext), {
+				fetch: async (_url, init) => {
+					busyAccounts.push(new Headers(init.headers).get("authorization"));
+					return busyAccounts.length < 3
+						? Response.json({ error: { code: "server_error", message: "Synthetic service failure" } }, { status: 503 })
+						: completed();
+				},
+			}).result(),
+		{ enabled: true, maxRetries: 2, baseDelayMs: 0 },
+	);
+	assert.equal(recoveredBusy.stopReason, "stop", recoveredBusy.errorMessage);
+	assert.equal(busyAccounts.length, 3);
+	assert.equal(new Set(busyAccounts).size, 1, "native Pi retries must retain the selected account");
+	assert.equal(usageCalls, 0, "busy services must not trigger quota queries");
+
 	const shared = new SharedPoolState(join(agentDir, "multi-pass.sqlite"));
 	const primaryKey = accountKey(names[0], tokens.get(names[0]));
 	try {
@@ -413,8 +434,6 @@ try {
 	assert.equal(stopped.stopReason, "error");
 	assert.match(stopped.errorMessage, /Pool stopped after/);
 	assert.equal(stopped.diagnostics.at(-1).type, "pool_request_failure");
-	const aiPackage = findPackageJSON("@earendil-works/pi-ai", join(piPackage, "package.json"));
-	const { isRetryableAssistantError } = createRequire(aiPackage)("./dist/utils/retry.js");
 	assert.equal(isRetryableAssistantError(stopped), false, "Pi must not restart the pool's completed retry budget");
 
 	// Exercise configured headers through Pi's actual request preparation.
@@ -561,6 +580,111 @@ try {
 	await assert.rejects(extension.commands.get("pool").handler("project", rpc));
 	assert.deepEqual(JSON.parse(readFileSync(projectPath, "utf8")).allowedSubs, [names[1]]);
 
+	// Status pages expose useful state without duplicating limits or credential internals.
+	const views = [];
+	const compactUi = {
+		...rpc.ui,
+		select: async (title, choices) => {
+			views.push({ title, choices });
+			return undefined;
+		},
+	};
+	const compactContext = { ...rpc, cwd, ui: compactUi };
+	const displayState = new SharedPoolState(join(agentDir, "multi-pass.sqlite"));
+	let displayLease;
+	try {
+		for (const name of names) displayState.succeed(accountKey(name, tokens.get(name)), Date.now() + 1);
+		displayLease = displayState.reserve([{ provider: names[0], key: primaryKey }], 2);
+		assert.ok(displayLease);
+		displayState.fail(accountKey(names[1], tokens.get(names[1])), "synthetic private error", Date.now() + 60_000);
+		await extension.commands.get("pool").handler("status", compactContext);
+		const poolStatus = views.at(-1).choices;
+		assert.equal(poolStatus.length, names.length + 1, "one heading and one line per member");
+		assert.match(poolStatus[0], /test · enabled · round-robin · 2\/3 available/);
+		assert.match(poolStatus[1], /available · 1\/2/);
+		assert.match(poolStatus[2], /cooling down · 0\/2/);
+		assert.doesNotMatch(poolStatus.join("\n"), /waiting|quota:|checked|last rejection|synthetic private error|until/);
+
+		let openedPool = false;
+		compactUi.select = async (title, choices) => {
+			views.push({ title, choices });
+			if (title === "Pools" && !openedPool) {
+				openedPool = true;
+				return choices.find((choice) => choice.startsWith("test "));
+			}
+			if (title === "test") return choices.find((choice) => choice.startsWith("inspect "));
+			return undefined;
+		};
+		await extension.commands.get("pool").handler("list", compactContext);
+		assert.deepEqual(views.find((view) => view.title === "Pool Status: test").choices, poolStatus);
+
+		const scheduledStatus = structuredClone(config);
+		scheduledStatus.pools[0].strategy = "scheduled";
+		scheduledStatus.pools[0].memberSchedule = {
+			[names[0]]: {
+				role: "preferred",
+				windows: [{ hours: [(new Date().getHours() + 1) % 24, (new Date().getHours() + 2) % 24] }],
+			},
+		};
+		try {
+			writeFileSync(configPath, JSON.stringify(scheduledStatus));
+			await extension.commands.get("pool").handler("status", compactContext);
+			assert.match(views.at(-1).choices[0], /1\/3 available/);
+			assert.match(views.at(-1).choices[1], /outside schedule/);
+		} finally {
+			writeFileSync(configPath, JSON.stringify(config));
+		}
+
+		const damagedCredentials = JSON.parse(credentialsBefore);
+		damagedCredentials[names[2]].access = "damaged";
+		try {
+			writeFileSync(join(agentDir, "auth.json"), JSON.stringify(damagedCredentials));
+			await extension.commands.get("pool").handler("status", compactContext);
+			assert.match(views.at(-1).choices[3], /invalid credential/);
+		} finally {
+			writeFileSync(join(agentDir, "auth.json"), credentialsBefore);
+		}
+
+		compactUi.select = async (title, choices) => {
+			views.push({ title, choices });
+			return undefined;
+		};
+		await extension.commands.get("pool").handler("", compactContext);
+		assert.deepEqual(
+			views.at(-1).choices.map((choice) => choice.split(" ")[0]),
+			["create", "list", "chain", "project"],
+		);
+		await extension.commands.get("subs").handler("", compactContext);
+		assert.deepEqual(
+			views.at(-1).choices.map((choice) => choice.split(/\s|—/)[0]),
+			["list", "add", "switch", "status", "limits"],
+		);
+		await extension.commands.get("subs").handler("status", compactContext);
+		const accountStatus = views.at(-1).choices;
+		assert.equal(accountStatus.length, names.length);
+		assert.ok(accountStatus.every((line) => line.includes("logged in") && line.includes("test")));
+		assert.doesNotMatch(accountStatus.join("\n"), /expires|expired|models|saved|\benv\b/);
+
+		let inspectedLimit = false;
+		compactUi.select = async (title, choices) => {
+			views.push({ title, choices });
+			if (title === "Subscription Limits" && !inspectedLimit) {
+				inspectedLimit = true;
+				return choices[0];
+			}
+			return undefined;
+		};
+		await extension.commands.get("subs").handler("limits", compactContext);
+		const limitDetails = views.find((view) => view.title.startsWith("Limit Details:")).choices;
+		assert.ok(limitDetails.some((line) => line.startsWith("5-hour window:")));
+		assert.ok(limitDetails.some((line) => line.startsWith("7-day window:")));
+		assert.doesNotMatch(limitDetails.join("\n"), /endpoint:|provider:|account:/);
+	} finally {
+		if (displayLease) displayState.release(displayLease.id);
+		for (const name of names) displayState.succeed(accountKey(name, tokens.get(name)), Date.now() + 1);
+		displayState.close();
+	}
+
 	const beforeCancel = readFileSync(configPath, "utf8");
 	for (const strategy of [undefined, "scheduled"]) {
 		let memberChosen = false;
@@ -659,9 +783,19 @@ try {
 	assert.equal(JSON.parse(readFileSync(configPath, "utf8")).chains.at(-1).entries[0].pool, "__done__");
 	let inspectedChain = false;
 	rpc.ui.select = async (title, choices) => {
-		if (title === "Chain Manager") return choices.find((choice) => choice.startsWith("status "));
-		if (title === "Chain Status") return choices.find((choice) => choice.startsWith("chain -- team — "));
-		if (title === "Chain Status: chain -- team") inspectedChain = true;
+		if (title === "Chain Manager") {
+			assert.equal(
+				choices.some((choice) => choice.startsWith("status ")),
+				false,
+			);
+			return choices.find((choice) => choice.startsWith("list "));
+		}
+		if (title === "Chains") return choices.find((choice) => choice.startsWith("chain -- team — "));
+		if (title === "Chain: chain -- team") {
+			inspectedChain = true;
+			assert.equal(choices.length, 2, "one chain heading and one ordered entry");
+			assert.doesNotMatch(choices.join("\n"), /usable entries|invalid entries|chain state|authed/);
+		}
 		return undefined;
 	};
 	await extension.commands.get("pool").handler("chain", rpc);

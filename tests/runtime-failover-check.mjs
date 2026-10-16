@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 import { accountKey } from "../src/limits.mts";
 import { cleanupSessionResources } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, retryAssistantCall } from "@earendil-works/pi-ai/utils/retry";
 import { SharedPoolState } from "../src/shared-state.mts";
 import { PoolRouter, CodexConnections, previousResponse, eventStream } from "./fixtures/router-harness.mjs";
 
@@ -81,7 +82,7 @@ function fixture({ action = async () => ({}), count = 3, retries = 3, chains = [
 					selected,
 				);
 				message.stopReason = "error";
-				message.errorMessage = "The usage limit has been reached";
+				message.errorMessage = result.message ?? "The usage limit has been reached";
 				stream.push({ type: "error", reason: "error", error: message });
 			} else stream.push({ type: "done", reason: "stop", message });
 			stream.end();
@@ -186,6 +187,118 @@ test = fixture({
 assert.equal((await test.request().result()).stopReason, "error");
 assert.equal(test.calls.length, 2, "one initial request plus one configured retry");
 assert.equal(test.checks(), 1);
+test.state.close();
+
+// Pi owns transient retries; the router retains the same request route without a cooldown.
+for (const rejection of [
+	{ error: "server_error", status: 503, message: "Synthetic upstream failure" },
+	{ error: "server_busy", status: 200, message: "Synthetic upstream failure" },
+	{ error: "text-only", status: 200, message: "network error" },
+]) {
+	test = fixture({ retries: 0, action: async ({ calls }) => (calls.length <= 2 ? rejection : {}) });
+	const context = input();
+	const retried = await retryAssistantCall(
+		() => test.request(structuredClone(context)).result(),
+		{ enabled: true, maxRetries: 2, baseDelayMs: 0 },
+		undefined,
+		{
+			onRetryScheduled: async () => {
+				assert.deepEqual(test.state.snapshot().accounts, {}, "busy service must not penalize an account");
+				assert.equal(Object.keys(test.state.snapshot().leases).length, 0);
+			},
+		},
+	);
+	assert.equal(retried.stopReason, "stop", retried.errorMessage);
+	assert.equal(test.calls.length, 3, "only Pi's retry budget applies to service errors");
+	assert.equal(new Set(test.calls.map((call) => call.provider)).size, 1);
+	assert.equal(test.checks(), 0);
+	assert.equal(test.router.retries.size, 0, "success clears the retained route");
+	test.state.close();
+}
+
+test = fixture({ action: async () => ({ error: "server_error", status: 503 }) });
+const unavailable = await test.request().result();
+assert.equal(test.calls.length, 1, "a busy response must not trigger an internal account switch");
+assert.equal(isRetryableAssistantError(unavailable), true);
+assert.equal(unavailable.diagnostics?.some((entry) => entry.type === "pool_request_failure") ?? false, false);
+assert.equal(test.router.retries.size, 1);
+cleanupSessionResources("session");
+assert.equal(test.router.retries.size, 0, "session cleanup releases retained request routes");
+test.state.close();
+
+test = fixture({ action: async () => ({ error: "server_error", status: 503 }) });
+const backoffAbort = new AbortController();
+const canceledBackoff = await retryAssistantCall(
+	() => test.request(input(), { signal: backoffAbort.signal }).result(),
+	{ enabled: true, maxRetries: 2, baseDelayMs: 0 },
+	backoffAbort.signal,
+	{ onRetryScheduled: async () => backoffAbort.abort() },
+);
+assert.equal(canceledBackoff.stopReason, "aborted");
+assert.equal(test.calls.length, 1);
+assert.equal(test.router.retries.size, 0, "cancellation during Pi's backoff releases the route");
+test.state.close();
+
+test = fixture({ action: async ({ calls }) => (calls.length === 1 ? { error: "server_error", status: 503 } : {}) });
+const busyContext = input();
+const busyResponse = await test.request(busyContext).result();
+await test.request(input(), { sessionId: "other-child" }).result();
+const retryContext = structuredClone(busyContext);
+retryContext.messages.push(busyResponse);
+const busyContinuation = await test.request(retryContext).result();
+assert.equal(busyContinuation.provider, busyResponse.provider, "another child cannot change the retained account");
+assert.notEqual(test.calls[1].provider, busyResponse.provider);
+assert.equal(test.router.retries.size, 0);
+test.state.close();
+
+test = fixture({ action: async () => ({ error: "server_error", status: 503 }) });
+const oldRequest = input();
+const oldBusy = await test.request(oldRequest).result();
+const newRequest = input();
+newRequest.messages[0].timestamp = oldRequest.messages[0].timestamp + 1;
+assert.notEqual(
+	(await test.request(newRequest).result()).provider,
+	oldBusy.provider,
+	"a new user message rotates normally",
+);
+cleanupSessionResources("session");
+test.state.close();
+
+test = fixture({
+	count: 2,
+	retries: 0,
+	poolOverrides: { backup: { contextWindow: 750 } },
+	action: async ({ calls }) => (calls.length === 1 ? { error: "server_error", status: 503 } : {}),
+});
+test.config.pools[0].members = [test.providers[0]];
+test.config.pools.push({ name: "backup", members: [test.providers[1]], enabled: true });
+test.config.chains.push({
+	enabled: true,
+	entries: [
+		{ pool: "primary", model: "model-a", enabled: true },
+		{ pool: "backup", model: "model-b", enabled: true },
+	],
+});
+let allowPrimary = false;
+test.router.dependencies.order = async (pool, members) => ({
+	members: pool === "primary" && !allowPrimary ? [] : members,
+	ordered: false,
+});
+const backupBusyContext = input();
+const backupBusy = await test.request(backupBusyContext).result();
+assert.equal(backupBusy.provider, test.providers[1]);
+allowPrimary = true;
+const backupRetry = await test.request(structuredClone(backupBusyContext)).result();
+assert.equal(backupRetry.provider, backupBusy.provider);
+assert.equal(backupRetry.model, "model-b");
+assert.equal(test.calls.at(-1).contextWindow, 750, "service retries retain backup pool metadata");
+test.state.close();
+
+test = fixture({ action: async ({ calls }) => (calls.length === 1 ? { error: "invalid_api_key", status: 401 } : {}) });
+assert.equal((await test.request().result()).stopReason, "stop");
+assert.equal(test.calls.length, 2, "an explicit account rejection can switch accounts");
+assert.notEqual(test.calls[0].provider, test.calls[1].provider);
+assert.equal(test.checks(), 0);
 test.state.close();
 
 test = fixture({ action: async () => ({ error: "usage_limit_reached" }) });
