@@ -5,7 +5,7 @@ import {
 	normalizeMultiPassConfig,
 	normalizeProjectConfig,
 } from "../src/config.mts";
-import { selectAccountModel, buildPoolModels } from "../src/models.mts";
+import { selectAccountModel, buildPoolModels, validateVirtualPoolConfig } from "../src/models.mts";
 
 const config = normalizeMultiPassConfig({ subscriptions: [{ provider: "openai-codex", index: 2 }] });
 assert.deepEqual(
@@ -23,4 +23,31 @@ const pool = buildPoolModels({ name: "pool", baseProvider: "openai-codex", membe
 pool[0].thinkingLevelMap.low = "high";
 assert.equal(member.thinkingLevelMap.low, "low", "pool metadata must not mutate account models");
 assert.equal(pool[0].provider, "pool");
+assert.doesNotThrow(() => validateVirtualPoolConfig("pool", undefined));
+assert.doesNotThrow(() =>
+	validateVirtualPoolConfig("pool", {
+		modelOverrides: { "model-a": { contextWindow: 64000 } },
+	}),
+);
+for (const definition of [{ id: "model-a" }, { id: "model-a", headers: { "x-pool": "synthetic" } }]) {
+	assert.throws(() => validateVirtualPoolConfig("pool", { models: [definition] }), /modelOverrides/);
+}
+assert.doesNotThrow(() =>
+	validateVirtualPoolConfig("pool", {
+		api: "openai-codex-responses",
+		baseUrl: "https://example.invalid",
+		models: [{ id: "model-a" }],
+	}),
+);
+assert.doesNotThrow(() =>
+	validateVirtualPoolConfig("pool", {
+		models: [
+			{
+				id: "model-a",
+				api: "openai-codex-responses",
+				baseUrl: "https://example.invalid",
+			},
+		],
+	}),
+);
 console.log("production model selection and pool metadata isolation checks passed");

@@ -31,7 +31,8 @@ import { existsSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { spawn } from "node:child_process";
 import { createRequire, findPackageJSON } from "node:module";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	accountProviders,
 	addSubscription,
@@ -72,10 +73,15 @@ import {
 	readStoredCredential,
 	ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import { setTimeout as wait } from "node:timers/promises";
 import { accountKey, record as getRecord } from "../src/limits.mts";
-import { buildPoolModels, configuredHeaderNames, selectAccountModel } from "../src/models.mts";
+import {
+	buildPoolModels,
+	configuredHeaderNames,
+	selectAccountModel,
+	validateVirtualPoolConfig,
+} from "../src/models.mts";
 import {
 	classifyCodexQuotaKind,
 	exhaustedResetAt,
@@ -84,6 +90,7 @@ import {
 } from "../src/quota.mts";
 import { CodexConnections, PoolRouter, type RoutingStatus } from "../src/pool-router.mts";
 import { selectCustomMember } from "../src/selector.mts";
+import { childExtensionRegistry } from "../src/subagents.mts";
 import {
 	SharedPoolState,
 	activeRequests,
@@ -141,6 +148,13 @@ const { FileAuthStorageBackend } = createRequire(join(getPackageDir(), "package.
 ) as {
 	FileAuthStorageBackend: new () => {
 		withLockAsync<T>(change: (source: string | undefined) => Promise<{ result: T; next?: string }>): Promise<T>;
+	};
+};
+
+// Use the host parser so models.json keeps its JSONC, BOM and schema semantics.
+const { ModelConfig } = createRequire(join(getPackageDir(), "package.json"))("./dist/core/model-config.js") as {
+	ModelConfig: {
+		load(path: string): Promise<{ getProvider(provider: string): unknown; getError(): string | undefined }>;
 	};
 };
 
@@ -982,29 +996,39 @@ function getPoolModels(pool: PoolConfig | undefined): Model<Api>[] {
 	return buildPoolModels(pool, (provider) => [...accountRuntime.getModels(provider)]);
 }
 
-class PoolManager {
-	private registered = new Set<string>();
-	private cwd = process.cwd();
-	private router: PoolRouter;
-	private pi: ExtensionAPI;
+function poolExecutionProvider(name: string, model: string): string {
+	// Colons are forbidden in pool names; each target can resolve its model headers before Pi's header hooks.
+	return `pi-codex-pool:${name}:${model}`;
+}
 
-	constructor(pi: ExtensionAPI) {
-		this.pi = pi;
-		this.router = this.createRouter(this.cwd);
+class PoolCatalog {
+	private runtime?: ModelRuntime;
+	private config?: Awaited<ReturnType<typeof ModelConfig.load>>;
+	private refreshing?: Promise<void>;
+	private registered = new Set<string>();
+	private cwd: string;
+
+	constructor(cwd: string) {
+		this.cwd = cwd;
 	}
 
-	private createRouter(cwd: string): PoolRouter {
-		let catalog: ModelRuntime | undefined;
-		let preparing: Promise<void> | undefined;
-		const registered = new Set<string>();
-		const prepare = () =>
-			(preparing ??= (async () => {
-				await refreshAccountModels();
-				catalog ??= await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
-				const pools = loadEffectiveConfig(cwd).pools.filter((pool) => pool.enabled);
+	refresh(): Promise<void> {
+		if (!this.refreshing)
+			this.refreshing = (async () => {
+				this.runtime ??= await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
+				const pools = loadEffectiveConfig(this.cwd).pools.filter((pool) => pool.enabled);
+				this.config = await ModelConfig.load(join(getAgentDir(), "models.json"));
+				const error = this.config.getError();
+				if (error) throw new Error(error);
+				for (const name of this.registered) {
+					if (pools.some((pool) => pool.name === name)) continue;
+					this.runtime.unregisterProvider(name);
+					this.registered.delete(name);
+				}
 				for (const pool of pools) {
-					if (registered.has(pool.name)) continue;
-					catalog.registerNativeProvider({
+					validateVirtualPoolConfig(pool.name, this.config.getProvider(pool.name));
+					if (this.registered.has(pool.name)) continue;
+					this.runtime.registerNativeProvider({
 						...codexTransport,
 						id: pool.name,
 						name: pool.name,
@@ -1013,16 +1037,50 @@ class PoolManager {
 							apiKey: { name: "Pool configuration", resolve: async () => ({ auth: {}, source: "Pool configuration" }) },
 						},
 						getModels: () =>
-							getPoolModels(loadEffectiveConfig(cwd).pools.find((entry) => entry.name === pool.name && entry.enabled)),
+							getPoolModels(
+								loadEffectiveConfig(this.cwd).pools.find((entry) => entry.name === pool.name && entry.enabled),
+							),
 					});
-					registered.add(pool.name);
+					this.registered.add(pool.name);
 				}
-				await catalog.refresh({ providers: pools.map((pool) => pool.name), allowNetwork: false });
+				await this.runtime.refresh({ providers: pools.map((pool) => pool.name), allowNetwork: false });
 			})().finally(() => {
-				preparing = undefined;
-			}));
+				this.refreshing = undefined;
+			});
+		return this.refreshing;
+	}
+
+	models(pool: string): readonly Model<Api>[] {
+		return this.runtime?.getModels(pool) ?? [];
+	}
+
+	model(pool: string, id: string): Model<Api> | undefined {
+		return this.runtime?.getModel(pool, id);
+	}
+
+	auth(model: Model<Api>, signal: AbortSignal) {
+		return this.runtime?.getAuth(model, { signal });
+	}
+
+	headerNames(model: Model<Api>): string[] {
+		return configuredHeaderNames(model, this.config?.getProvider(model.provider));
+	}
+}
+
+class PoolManager {
+	private registered = new Map<string, Map<string, Model<Api>>>();
+	private cwd = process.cwd();
+	private catalog = new PoolCatalog(this.cwd);
+	private router: PoolRouter;
+	private pi: ExtensionAPI;
+
+	constructor(pi: ExtensionAPI) {
+		this.pi = pi;
+		this.router = this.createRouter(this.cwd, this.catalog);
+	}
+
+	private createRouter(cwd: string, catalog: PoolCatalog): PoolRouter {
 		return new PoolRouter({
-			prepare,
 			state: getSharedPoolState,
 			config: () => loadEffectiveConfig(cwd),
 			member: getMember,
@@ -1031,16 +1089,10 @@ class PoolManager {
 				return (!allowed || allowed.includes(provider)) && readStoredCredential(provider)?.type === "oauth";
 			},
 			model: (provider, id) => accountRuntime.getModel(provider, id),
-			poolModel: async (name, id) => catalog?.getModel(name, id),
-			headerNames: (model) =>
-				configuredHeaderNames(
-					model,
-					readConfig(join(getAgentDir(), "models.json"), (raw) => raw),
-				),
-			auth: async (model, signal) => {
-				const runtime = isCodexProviderName(model.provider) ? accountRuntime : catalog;
-				return runtime?.getAuth(model, { signal });
-			},
+			poolModel: (name, id) => catalog.model(name, id),
+			headerNames: (model) => catalog.headerNames(model),
+			auth: async (model, signal) =>
+				isCodexProviderName(model.provider) ? accountRuntime.getAuth(model, { signal }) : catalog.auth(model, signal),
 			order: async (name, members, model, previous, prompt, signal) => {
 				const pool = loadEffectiveConfig(cwd).pools.find((candidate) => candidate.name === name);
 				if (pool?.strategy === "scheduled")
@@ -1107,57 +1159,128 @@ class PoolManager {
 		for (const entry of mergeConfigs(config, parseEnvConfig())) registerSub(this.pi, entry, this.streams);
 	}
 
-	setContext(ctx: ExtensionContext): void {
-		if (this.cwd !== ctx.cwd) {
-			this.cwd = ctx.cwd;
-			// Inherited providers retain their original project scope when the parent changes sessions.
-			for (const name of this.registered) this.pi.unregisterProvider(name);
-			this.registered.clear();
-			this.router = this.createRouter(ctx.cwd);
-			this.registerAccounts();
-		}
-		this.loadPools(loadEffectiveConfig(ctx.cwd).pools);
+	async initialize(): Promise<void> {
+		this.registerAccounts();
+		this.loadPools();
+		await refreshAccountModels();
+		await this.catalog.refresh();
+		for (const name of this.registered.keys()) this.registerPoolModels(name, this.catalog, this.router);
 	}
 
-	loadPools(configs: PoolConfig[]): void {
+	async setContext(ctx: ExtensionContext): Promise<void> {
+		const cwd = resolve(ctx.cwd);
+		if (this.cwd !== cwd) {
+			this.cwd = cwd;
+			// Inherited providers retain their original project scope when the parent changes sessions.
+			for (const name of this.registered.keys()) this.unregisterPool(name);
+			this.catalog = new PoolCatalog(cwd);
+			this.router = this.createRouter(cwd, this.catalog);
+			// New project models must be registered before the host's asynchronous refresh can observe them.
+			await this.initialize();
+		} else {
+			this.loadPools();
+		}
+		// Pi refreshes each pool's catalog and then publishes the execution providers' auth status.
+		await ctx.modelRegistry.refresh({ allowNetwork: false });
+	}
+
+	dispose(): void {
+		// Outstanding catalog refreshes must not register models after the extension runtime closes.
+		this.registered.clear();
+	}
+
+	private unregisterPool(name: string): void {
+		for (const id of this.registered.get(name)?.keys() ?? []) {
+			this.pi.unregisterVirtualModel(name, id);
+			this.pi.unregisterProvider(poolExecutionProvider(name, id));
+		}
+		this.pi.unregisterProvider(name);
+		this.registered.delete(name);
+	}
+
+	private registerPoolModels(name: string, catalog: PoolCatalog, router: PoolRouter): void {
+		const registered = this.registered.get(name);
+		if (!registered || catalog !== this.catalog) return;
+		const cwd = this.cwd;
+		const available = () =>
+			loadEffectiveConfig(cwd).pools.some(
+				(pool) =>
+					pool.name === name &&
+					pool.enabled &&
+					pool.members.some((member) => readStoredCredential(member)?.type === "oauth"),
+			);
+		const models = new Map((available() ? catalog.models(name) : []).map((model) => [model.id, model]));
+		for (const id of registered.keys()) {
+			if (models.has(id)) continue;
+			this.pi.unregisterVirtualModel(name, id);
+			this.pi.unregisterProvider(poolExecutionProvider(name, id));
+			registered.delete(id);
+		}
+		for (const model of models.values()) {
+			if (isDeepStrictEqual(registered.get(model.id), model)) continue;
+			registered.set(model.id, model);
+			const provider = poolExecutionProvider(name, model.id);
+			this.pi.registerProvider({
+				id: provider,
+				name,
+				getModels: () => [{ ...model, provider }],
+				filterModels: () => [],
+				auth: {
+					apiKey: {
+						name: "Pool member accounts",
+						check: async () => (available() ? { type: "api_key", source: "Pool member accounts" } : undefined),
+						resolve: async ({ signal }) => {
+							if (!available()) return undefined;
+							await catalog.refresh();
+							const source = catalog.model(name, model.id);
+							if (!source) throw new Error(`Pool ${name} has no model ${model.id}`);
+							return catalog.auth(source, signal);
+						},
+					},
+				},
+				...router.poolStreams(name),
+			});
+			this.pi.registerVirtualModel({
+				provider: name,
+				id: model.id,
+				name: model.name,
+				thinkingLevels: getSupportedThinkingLevels(model),
+				contextWindow: model.contextWindow,
+				maxTokens: model.maxTokens,
+				input: model.input,
+				route: (request, ctx) => {
+					const target = ctx.modelRegistry.find(provider, request.model.id);
+					if (!target) throw new Error(`Pool ${name} has no model ${request.model.id}`);
+					return { model: target, thinkingLevel: request.thinkingLevel };
+				},
+			});
+		}
+	}
+
+	private loadPools(): void {
+		const configs = loadEffectiveConfig(this.cwd).pools;
 		const enabled = new Set(configs.filter((pool) => pool.enabled).map((pool) => pool.name));
-		for (const name of this.registered) {
-			if (!enabled.has(name)) {
-				this.pi.unregisterProvider(name);
-				this.registered.delete(name);
-			}
+		for (const name of this.registered.keys()) {
+			if (!enabled.has(name)) this.unregisterPool(name);
 		}
 		for (const pool of configs) {
 			if (!pool.enabled || this.registered.has(pool.name)) continue;
 			const conflict = poolProviderNameError(pool.name);
 			if (conflict) throw new Error(conflict);
-			const cwd = this.cwd;
-			const configured = () =>
-				loadEffectiveConfig(cwd).pools.find((candidate) => candidate.name === pool.name && candidate.enabled);
-			this.pi.registerProvider({
-				id: pool.name,
-				name: pool.name,
-				auth: {
-					apiKey: {
-						name: "Pool member accounts",
-						check: async () =>
-							configured()?.members.some((member) => readStoredCredential(member)?.type === "oauth")
-								? { type: "api_key", source: "Pool member accounts" }
-								: undefined,
-						resolve: async () =>
-							configured()?.members.some((member) => readStoredCredential(member)?.type === "oauth")
-								? { auth: {}, source: "Pool member accounts" }
-								: undefined,
-					},
-				},
-				getModels: () => getPoolModels(configured()),
+			const catalog = this.catalog;
+			const router = this.router;
+			this.registered.set(pool.name, new Map());
+			// The public catalog contains only authenticated virtual selections, never request credentials.
+			this.pi.registerProvider(pool.name, {
+				apiKey: "pool",
+				models: [],
 				refreshModels: async () => {
 					await refreshAccountModels();
+					await catalog.refresh();
+					this.registerPoolModels(pool.name, catalog, router);
+					return [];
 				},
-				stream: this.router.stream,
-				streamSimple: this.router.streamSimple,
 			});
-			this.registered.add(pool.name);
 		}
 	}
 
@@ -1180,7 +1303,6 @@ class PoolManager {
 
 	async renameSelection(ctx: ExtensionCommandContext, previous: string, next: string): Promise<void> {
 		if (ctx.model?.provider !== previous) return;
-		await ctx.modelRegistry.refresh({ allowNetwork: false });
 		const selected = ctx.modelRegistry.find(next, ctx.model.id);
 		if (selected && !(await safeSetModel(this.pi, selected)))
 			ctx.ui.notify(`Select the renamed pool with /model ${next}.`, "warning");
@@ -1341,7 +1463,7 @@ async function removeSubscriptionEntry(
 		});
 	} catch (error) {
 		if (removed) {
-			reloadPoolManagerForCurrentProject(ctx, poolManager);
+			await poolManager.setContext(ctx);
 			throw new Error(`Removed ${name} from configuration, but credential cleanup failed; retry /logout ${name}`, {
 				cause: error,
 			});
@@ -1350,8 +1472,7 @@ async function removeSubscriptionEntry(
 	}
 	pi.unregisterProvider(name);
 	accountRuntime.unregisterProvider(name);
-	await ctx.modelRegistry.refresh();
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await poolManager.setContext(ctx);
 	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
 }
 
@@ -1701,10 +1822,6 @@ function buildPoolConfig(input: {
 	return { ok: true, pool };
 }
 
-function reloadPoolManagerForCurrentProject(ctx: ExtensionCommandContext, poolManager: PoolManager): void {
-	poolManager.loadPools(loadEffectiveConfig(ctx.cwd).pools);
-}
-
 async function renamePoolConfig(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
@@ -1744,7 +1861,7 @@ async function renamePoolConfig(
 			}
 		return renamePoolReferences(latest.chains, previousName, trimmedName);
 	});
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await poolManager.setContext(ctx);
 	await poolManager.renameSelection(ctx, previousName, trimmedName);
 	ctx.ui.notify(
 		updatedEntries > 0
@@ -1829,7 +1946,7 @@ async function editPoolMembers(
 				}
 			});
 			pool.members = [...selectedMembers];
-			reloadPoolManagerForCurrentProject(ctx, poolManager);
+			await poolManager.setContext(ctx);
 			ctx.ui.notify(
 				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.`,
 				"info",
@@ -2040,7 +2157,7 @@ async function createAndPersistPool(
 	if (!definition) return undefined;
 	const { pool, previous } = definition;
 	const action = updateGlobalConfig((config) => replaceNamed(config.pools, pool, previous));
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await poolManager.setContext(ctx);
 
 	const resumeSuffix = options?.resumeChainName ? ` Chain builder resumed for "${options.resumeChainName}".` : "";
 	ctx.ui.notify(
@@ -2124,7 +2241,7 @@ async function togglePoolConfig(
 		target.enabled = !target.enabled;
 		return target.enabled;
 	});
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await poolManager.setContext(ctx);
 	ctx.ui.notify(`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`, "info");
 }
 
@@ -2152,7 +2269,7 @@ async function changePoolStrategy(
 		target.memberSchedule = pool.memberSchedule;
 		target.selectorScript = pool.selectorScript;
 	});
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await poolManager.setContext(ctx);
 	ctx.ui.notify(`Pool "${pool.name}" strategy changed to ${nextStrategy}.`, "info");
 }
 
@@ -2183,7 +2300,7 @@ async function removePoolConfig(
 		latest.presets = latest.presets.filter((preset) => preset.entries.length > 0);
 		return pruned;
 	});
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await poolManager.setContext(ctx);
 
 	let message = `Removed pool "${pool.name}"`;
 	if (removedEntries > 0) {
@@ -2694,7 +2811,7 @@ async function handlePoolProject(ctx: ExtensionCommandContext, poolManager: Pool
 			for (const key of Object.keys(latest)) delete latest[key as keyof ProjectConfig];
 			Object.assign(latest, next);
 		});
-		reloadPoolManagerForCurrentProject(ctx, poolManager);
+		await poolManager.setContext(ctx);
 		ctx.ui.notify("Project configuration saved.", "info");
 		return;
 	}
@@ -2713,8 +2830,7 @@ async function handlePoolProject(ctx: ExtensionCommandContext, poolManager: Pool
 			updateProjectConfig(ctx.cwd, (latest) => {
 				for (const key of Object.keys(latest)) delete latest[key as keyof ProjectConfig];
 			});
-			const effective = loadEffectiveConfig(ctx.cwd);
-			poolManager.loadPools(effective.pools);
+			await poolManager.setContext(ctx);
 			ctx.ui.notify("Project config cleared. Using global pools.", "info");
 		} catch (err: unknown) {
 			ctx.ui.notify(`Failed: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -2778,8 +2894,7 @@ async function handlePoolProject(ctx: ExtensionCommandContext, poolManager: Pool
 			latest.allowedSubs = allowed.length > 0 ? allowed : undefined;
 		});
 
-		const effective = loadEffectiveConfig(ctx.cwd);
-		poolManager.loadPools(effective.pools);
+		await poolManager.setContext(ctx);
 
 		if (allowed.length > 0) {
 			ctx.ui.notify(`Project restricted to: ${allowed.join(", ")}`, "info");
@@ -2824,8 +2939,7 @@ async function handlePoolProject(ctx: ExtensionCommandContext, poolManager: Pool
 			updateProjectConfig(ctx.cwd, (latest) => {
 				delete latest.pools;
 			});
-			const effective = loadEffectiveConfig(ctx.cwd);
-			poolManager.loadPools(effective.pools);
+			await poolManager.setContext(ctx);
 			ctx.ui.notify("Project will use global pools.", "info");
 			return;
 		}
@@ -2848,8 +2962,7 @@ async function handlePoolProject(ctx: ExtensionCommandContext, poolManager: Pool
 			latest.pools = pools;
 			return pools;
 		});
-		const effective = loadEffectiveConfig(ctx.cwd);
-		poolManager.loadPools(effective.pools);
+		await poolManager.setContext(ctx);
 
 		const activeNames = projectPools.map((p) => (typeof p === "string" ? p : p.name)).join(", ") || "none";
 		ctx.ui.notify(`Project pools: ${activeNames}`, "info");
@@ -3251,11 +3364,12 @@ async function handlePresetMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 export default async function multiSub(pi: ExtensionAPI) {
 	accountRuntime = await ModelRuntime.create({ allowModelNetwork: false });
 	const poolManager = new PoolManager(pi);
+	const children = await childExtensionRegistry();
+	let childRegistration: { dispose(): void } | undefined;
 	let sessionStarted = false;
 	let removeStatusListener: (() => void) | undefined;
 	let removeWarningListener: (() => void) | undefined;
-	poolManager.registerAccounts();
-	poolManager.loadPools(loadEffectiveConfig(process.cwd()).pools);
+	await poolManager.initialize();
 
 	let projectRestrictionSwitchInFlight = false;
 	const enforceProjectRestriction = async (ctx: ExtensionContext | ExtensionCommandContext): Promise<boolean> => {
@@ -3307,7 +3421,12 @@ export default async function multiSub(pi: ExtensionAPI) {
 			sessionStarted = true;
 		}
 		const effective = loadEffectiveConfig(ctx.cwd);
-		poolManager.setContext(ctx);
+		await poolManager.setContext(ctx);
+		childRegistration?.dispose();
+		childRegistration = children?.registerRequiredChildExtensions({
+			sessionId: ctx.sessionManager.getSessionId(),
+			extensions: [{ id: "pi-codex-pool", path: fileURLToPath(import.meta.url) }],
+		});
 		removeStatusListener?.();
 		removeWarningListener?.();
 		removeWarningListener = pi.events.on("multi-pass:warning", (message) => ctx.ui.notify(String(message), "warning"));
@@ -3348,6 +3467,9 @@ export default async function multiSub(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		poolManager.dispose();
+		childRegistration?.dispose();
+		childRegistration = undefined;
 		removeStatusListener?.();
 		removeStatusListener = undefined;
 		removeWarningListener?.();
@@ -3376,7 +3498,7 @@ export default async function multiSub(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
-		poolManager.setContext(ctx);
+		await poolManager.setContext(ctx);
 	});
 
 	// Register /subs command

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { createRequire, findPackageJSON } from "node:module";
+import { createRequire, findPackageJSON, registerHooks } from "node:module";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { accountKey } from "../../src/limits.mts";
@@ -11,6 +11,24 @@ import { SharedPoolState } from "../../src/shared-state.mts";
 const piManifest = findPackageJSON("@earendil-works/pi-coding-agent", import.meta.url);
 assert.ok(piManifest, "Install the development dependencies before running this check");
 const piPackage = process.argv[2] ?? dirname(piManifest);
+const subagentsPackage = process.argv[3];
+// An optional installed host can be exercised without adding it to development dependencies.
+const moduleHooks =
+	subagentsPackage &&
+	registerHooks({
+		resolve(specifier, context, nextResolve) {
+			if (specifier === "pi-subagents/required-child-extensions") {
+				return {
+					url: pathToFileURL(join(subagentsPackage, "src/api/required-child-extensions.js")).href,
+					shortCircuit: true,
+				};
+			}
+			if (specifier === "typebox" || specifier.startsWith("typebox/") || specifier.startsWith("@earendil-works/pi-")) {
+				return nextResolve(specifier, { ...context, parentURL: pathToFileURL(join(piPackage, "package.json")).href });
+			}
+			return nextResolve(specifier, context);
+		},
+	});
 const agentDir = mkdtempSync(join(tmpdir(), "multi-pass-runtime-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 mkdirSync(agentDir, { recursive: true });
@@ -58,6 +76,10 @@ writeFileSync(
 	),
 );
 const credentialsBefore = readFileSync(join(agentDir, "auth.json"), "utf8");
+writeFileSync(
+	join(agentDir, "models.json"),
+	'\uFEFF{\n// Synthetic pool configuration\n"providers":{"test":{"headers":{"x-jsonc":"synthetic"}}}\n}',
+);
 const { loadExtensions } = await import(pathToFileURL(join(piPackage, "dist/core/extensions/loader.js")).href);
 const { ModelRuntime } = await import(pathToFileURL(join(piPackage, "dist/core/model-runtime.js")).href);
 const { createEventBus } = await import(pathToFileURL(join(piPackage, "dist/core/event-bus.js")).href);
@@ -90,10 +112,28 @@ try {
 	const runtime = await ModelRuntime.create({ allowModelNetwork: false });
 	const aiPackage = findPackageJSON("@earendil-works/pi-ai", join(piPackage, "package.json"));
 	const { isRetryableAssistantError, retryAssistantCall } = createRequire(aiPackage)("./dist/utils/retry.js");
-	function applyRegistrations(target) {
-		for (const entry of loaded.runtime.pendingProviderRegistrations) target.registerProvider(entry.name, entry.config);
-		for (const entry of loaded.runtime.pendingNativeProviderRegistrations)
+	function applyRegistrations(target, extensionRuntime = loaded.runtime) {
+		for (const entry of extensionRuntime.pendingProviderRegistrations)
+			target.registerProvider(entry.name, entry.config);
+		for (const entry of extensionRuntime.pendingNativeProviderRegistrations)
 			target.registerNativeProvider(entry.provider);
+		for (const entry of extensionRuntime.pendingVirtualModelRegistrations)
+			target.registerVirtualModel(entry.definition);
+	}
+	function bindRegistrations(target, extensionRuntime) {
+		for (const method of [
+			"registerProvider",
+			"registerNativeProvider",
+			"unregisterProvider",
+			"registerVirtualModel",
+			"unregisterVirtualModel",
+		]) {
+			const queue = extensionRuntime[method];
+			extensionRuntime[method] = (...args) => {
+				queue(...args);
+				target[method](...args);
+			};
+		}
 	}
 	applyRegistrations(runtime);
 	await runtime.refresh({ allowNetwork: false });
@@ -105,6 +145,12 @@ try {
 	const modelId = definitions[0].id;
 	const selected = runtime.getModel("test", modelId);
 	assert.ok(selected);
+	assert.equal(selected.api, "pi-virtual");
+	assert.equal(
+		(await runtime.getAvailable()).filter((model) => model.provider.startsWith("pi-codex-pool:")).length,
+		0,
+		"execution models must not appear in /model",
+	);
 	assert.ok((await runtime.getAvailable("test")).length > 0, "pool models must be available without separate login");
 	assert.equal(pool.auth.oauth, undefined, "the pool must not own a duplicate OAuth credential");
 	const ctx = {
@@ -121,6 +167,8 @@ try {
 			refresh: (options) => runtime.refresh({ allowNetwork: false, ...options }),
 		},
 	};
+	loaded.runtime.createContext = () => ctx;
+	bindRegistrations(runtime, loaded.runtime);
 	loaded.runtime.setModel = async () => {
 		throw new Error("request routing must not change the selected model");
 	};
@@ -131,6 +179,17 @@ try {
 		for (const handler of extension.handlers.get(name) ?? []) await handler(event, ctx);
 	}
 	await emit("session_start", {});
+	// An empty credential set must not leave selectable pool models behind.
+	try {
+		writeFileSync(join(agentDir, "auth.json"), "{}");
+		await runtime.refresh({ allowNetwork: false });
+		assert.equal((await runtime.getAvailable("test")).length, 0);
+		assert.equal(runtime.getModel("test", modelId), undefined);
+	} finally {
+		writeFileSync(join(agentDir, "auth.json"), credentialsBefore);
+		await runtime.refresh({ allowNetwork: false });
+	}
+	assert.equal(runtime.getModel("test", modelId).api, "pi-virtual");
 	const input = () => ({
 		messages: [
 			{
@@ -187,6 +246,11 @@ try {
 	}
 	assert.deepEqual(providers, [names[0], names[1], names[2], names[0]]);
 	assert.equal(usageCalls, 0, "normal requests must not query quota");
+	assert.equal(
+		sent.at(-1).headers["x-jsonc"],
+		"synthetic",
+		"BOM and commented models.json must survive pool startup and dispatch",
+	);
 	const context = input();
 	const first = await request(context).result();
 	context.messages.push(first, {
@@ -199,9 +263,73 @@ try {
 	});
 	assert.equal((await request(context).result()).provider, first.provider);
 
-	// Frontend children inherit providers, without receiving the parent's lifecycle handlers.
+	// Reopen a real transcript whose responses retain their physical account identity.
+	const { createAgentSession } = await import(pathToFileURL(join(piPackage, "dist/core/sdk.js")).href);
+	const { SessionManager } = await import(pathToFileURL(join(piPackage, "dist/core/session-manager.js")).href);
+	const { SettingsManager } = await import(pathToFileURL(join(piPackage, "dist/core/settings-manager.js")).href);
+	const { DefaultResourceLoader } = await import(pathToFileURL(join(piPackage, "dist/core/resource-loader.js")).href);
+	const settings = SettingsManager.inMemory();
+	const resources = new DefaultResourceLoader({
+		cwd: agentDir,
+		agentDir,
+		settingsManager: settings,
+		noExtensions: true,
+		noSkills: true,
+		noThemes: true,
+		noPromptTemplates: true,
+		noContextFiles: true,
+	});
+	await resources.reload();
+	const saved = SessionManager.create(agentDir, join(agentDir, "sessions"));
+	saved.appendModelChange("test", modelId);
+	saved.appendThinkingLevelChange("high");
+	saved.appendMessage(input().messages[0]);
+	const poolLeaf = saved.appendMessage(first);
+	const reopen = async (sessionManager, expected, explicit) => {
+		const result = await createAgentSession({
+			cwd: agentDir,
+			agentDir,
+			sessionManager,
+			modelRuntime: runtime,
+			settingsManager: settings,
+			resourceLoader: resources,
+			tools: [],
+			model: explicit,
+		});
+		try {
+			assert.equal(result.modelFallbackMessage, undefined);
+			assert.equal(result.session.model.provider, expected);
+			assert.equal(result.session.model.id, modelId);
+			assert.equal(result.session.thinkingLevel, "high");
+			assert.equal(
+				result.session.messages.findLast((message) => message.role === "assistant").provider,
+				first.provider,
+			);
+		} finally {
+			result.session.dispose();
+		}
+	};
+	await reopen(SessionManager.open(saved.getSessionFile()), "test");
+	saved.appendCompaction("Synthetic summary", poolLeaf, 1);
+	await reopen(SessionManager.open(saved.getSessionFile()), "test");
+	saved.appendModelChange(first.provider, modelId);
+	saved.appendMessage(first);
+	await reopen(SessionManager.open(saved.getSessionFile()), first.provider);
+	const forked = saved.createBranchedSession(poolLeaf);
+	assert.ok(forked);
+	await reopen(SessionManager.open(forked), "test");
+	await reopen(SessionManager.open(forked), names[0], runtime.getModel(names[0], modelId));
+
+	// Native children load their own virtual definitions and bind them to the child's registry.
 	const child = await ModelRuntime.create({ allowModelNetwork: false });
-	applyRegistrations(child);
+	const childLoaded = await loadExtensions([source], cwd, eventBus);
+	assert.deepEqual(childLoaded.errors, []);
+	applyRegistrations(child, childLoaded.runtime);
+	childLoaded.runtime.createContext = () => ({
+		...ctx,
+		modelRegistry: { find: (provider, id) => child.getModel(provider, id) },
+	});
+	bindRegistrations(child, childLoaded.runtime);
 	await child.refresh({ allowNetwork: false });
 	const childModel = child.getModel("test", modelId);
 	const responses = await Promise.all([
@@ -218,6 +346,57 @@ try {
 	);
 	assert.notEqual(sent.at(-1).bearer, sent.at(-2).bearer);
 	assert.equal(ctx.model.provider, "test");
+
+	if (subagentsPackage) {
+		const { resolveRequiredChildExtensions } = await import(
+			pathToFileURL(join(subagentsPackage, "src/shared/required-child-extensions.js")).href
+		);
+		const required = resolveRequiredChildExtensions("test-session");
+		assert.equal(required.length, 1, "the parent must register its pool extension for child loading");
+		const { createDefaultChildSessionFactory } = await import(
+			pathToFileURL(join(subagentsPackage, "src/runs/shared/child-session.js")).href
+		);
+		const factory = createDefaultChildSessionFactory({
+			loadPiCodingAgent: () => import(pathToFileURL(join(piPackage, "dist/index.js")).href),
+		});
+		const errors = [];
+		const beforeChild = globalThis.fetch;
+		globalThis.fetch = async (url) => {
+			assert.match(String(url), /\/codex\/responses$/, "native children must only reach the response stub");
+			return completed();
+		};
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ transport: "sse" }));
+		try {
+			const nativeChild = await factory.create({
+				cwd: agentDir,
+				parentProviderRegistry: runtime,
+				storage: { kind: "memory" },
+				model: `test/${modelId}:high`,
+				tools: [],
+				extensionPaths: required.map((entry) => entry.path),
+				requiredExtensions: required,
+				ambientExtensions: false,
+				hooks: [],
+				noSkills: true,
+				noContextFiles: true,
+				runtime: { depth: 1, fanoutChild: false, fast: false },
+				onExtensionError: (error) => errors.push(error),
+			});
+			assert.equal(nativeChild.virtualModelId, `test/${modelId}`);
+			await nativeChild.prompt("Synthetic child input");
+			assert.deepEqual(errors, []);
+			const answered = nativeChild.messages.findLast((message) => message.role === "assistant");
+			assert.equal(answered.stopReason, "stop", answered.errorMessage);
+			assert.ok(names.includes(answered.provider));
+			assert.equal(nativeChild.virtualModelId, `test/${modelId}`);
+			assert.equal(resolveRequiredChildExtensions(nativeChild.sessionId).length, 1);
+			await nativeChild.dispose();
+			assert.equal(resolveRequiredChildExtensions(nativeChild.sessionId).length, 0);
+		} finally {
+			await factory.dispose();
+			globalThis.fetch = beforeChild;
+		}
+	}
 
 	const waiting = [];
 	let entered = 0;
@@ -287,8 +466,29 @@ try {
 	};
 	for (const handler of extension.handlers.get("session_start") ?? []) await handler({}, scopedContext);
 	const scopedChild = await ModelRuntime.create({ allowModelNetwork: false });
-	applyRegistrations(scopedChild);
-	await scopedChild.refresh({ allowNetwork: false });
+	const scopedLoaded = await loadExtensions([source], cwd, eventBus);
+	assert.deepEqual(scopedLoaded.errors, []);
+	const scopedChildContext = {
+		...scopedContext,
+		sessionManager: { getSessionId: () => "scoped-child-session" },
+		modelRegistry: {
+			...scopedContext.modelRegistry,
+			getAll: () => [...scopedChild.getModels()],
+			find: (provider, id) => scopedChild.getModel(provider, id),
+			getProviderAuthStatus: (provider) => scopedChild.getProviderAuthStatus(provider),
+			refresh: (options) => scopedChild.refresh({ allowNetwork: false, ...options }),
+		},
+	};
+	applyRegistrations(scopedChild, scopedLoaded.runtime);
+	scopedLoaded.runtime.createContext = () => scopedChildContext;
+	bindRegistrations(scopedChild, scopedLoaded.runtime);
+	for (const handler of scopedLoaded.extensions[0].handlers.get("session_start") ?? [])
+		await handler({}, scopedChildContext);
+	assert.equal(
+		scopedChild.getModel("test", modelId)?.api,
+		"pi-virtual",
+		"project initialization must publish its virtual selection before returning",
+	);
 	const scopedResponse = await request(
 		input(),
 		{ sessionId: "restricted-child" },
@@ -465,7 +665,10 @@ try {
 			providers: {
 				[names[0]]: { modelOverrides: { [modelId]: { headers: { "x-member-model": "first" } } } },
 				[names[1]]: { modelOverrides: { [modelId]: { headers: { "x-member-model": "second" } } } },
-				test: { headers: { "x-pool-scope": "primary", "x-primary-only": "yes", "x-dynamic": dynamicHeader } },
+				test: {
+					headers: { "x-pool-scope": "primary", "x-primary-only": "yes", "x-dynamic": dynamicHeader },
+					modelOverrides: { [modelId]: { headers: { "x-model-private": "synthetic" } } },
+				},
 				backup: { headers: { "x-pool-scope": "backup", "x-backup-only": "yes" } },
 			},
 		};
@@ -498,11 +701,41 @@ try {
 			"backup",
 			"same-name caller fields remain scoped to the source pool",
 		);
-		assert.equal(sent.at(-1).headers["x-explicit"], "kept");
+		assert.equal(
+			sent.at(-1).headers["x-explicit"],
+			undefined,
+			"Pi isolates explicit headers when a virtual call changes providers",
+		);
+
+		state.succeed(primaryKey, Date.now() + 1);
+		const commandsBefore = readFileSync(headerLog, "utf8").trim().split("\n").length;
+		let inspectedHeaders;
+		const filtered = await request(
+			input(),
+			{
+				transformHeaders: (headers) => {
+					inspectedHeaders = { ...headers };
+					for (const name of Object.keys(headers)) {
+						if (name.startsWith("x-primary") || name.startsWith("x-model")) delete headers[name];
+					}
+					return headers;
+				},
+			},
+			headerModel,
+		).result();
+		assert.equal(filtered.stopReason, "stop", filtered.errorMessage);
+		assert.equal(inspectedHeaders["x-primary-only"], "yes");
+		assert.equal(inspectedHeaders["x-model-private"], "synthetic");
+		assert.equal(sent.at(-1).headers["x-primary-only"], undefined);
+		assert.equal(sent.at(-1).headers["x-model-private"], undefined);
+		assert.equal(readFileSync(headerLog, "utf8").trim().split("\n").length, commandsBefore + 1);
+		state.fail(primaryKey, "synthetic cooldown", Date.now() + 60_000, Date.now() + 3_600_000);
 
 		// A model added after extension loading must be selectable and routable.
 		const customId = "synthetic-added-model";
-		headerConfig.providers[names[1]].models = [{ ...definitions[0], id: customId, name: "Synthetic model" }];
+		headerConfig.providers[names[1]].models = [
+			{ ...runtime.getModel(names[1], modelId), id: customId, name: "Synthetic model" },
+		];
 		writeFileSync(join(agentDir, "models.json"), JSON.stringify(headerConfig));
 		config.pools[0].members = [names[1]];
 		writeFileSync(configPath, JSON.stringify(config));
@@ -909,16 +1142,20 @@ try {
 	config.pools[0].enabled = false;
 	writeFileSync(configPath, JSON.stringify(config));
 	await emit("before_agent_start", {});
+	assert.equal(runtime.getModel("test", modelId), undefined);
 	assert.equal(
-		loaded.runtime.pendingNativeProviderRegistrations.some((entry) => entry.provider.id === "test"),
+		runtime.getRegisteredProviderIds().some((provider) => provider.startsWith("pi-codex-pool:test:")),
 		false,
 	);
 	assert.equal(readFileSync(join(agentDir, "auth.json"), "utf8"), credentialsBefore);
+	for (const handler of scopedLoaded.extensions[0].handlers.get("session_shutdown") ?? [])
+		await handler({}, scopedContext);
 	await emit("session_shutdown", {});
 	console.log(
 		"native pool discovery, inherited child providers, independent thinking, concurrency, cancellation, in-request failover, quota deduplication, and disable checks passed",
 	);
 } finally {
+	moduleHooks?.deregister();
 	globalThis.fetch = previousFetch;
 	for (const resolve of waitingResolvers) resolve();
 }

@@ -45,14 +45,13 @@ export interface RoutingStatus {
 }
 
 interface RouterDependencies {
-	prepare?(): Promise<void>;
 	warn?(message: string): void;
 	state(): SharedPoolState;
 	config(): RoutingConfig;
 	member(provider: string): Member;
 	hasAuth(provider: string): boolean;
 	model(provider: string, id: string): Model<Api> | undefined;
-	poolModel(pool: string, id: string): Promise<Model<Api> | undefined>;
+	poolModel(pool: string, id: string): Model<Api> | undefined;
 	headerNames(model: Model<Api>): string[];
 	auth(model: Model<Api>, signal: AbortSignal): Promise<AuthResult | undefined>;
 	order(
@@ -221,6 +220,14 @@ export class PoolRouter {
 		}
 	}
 
+	/** A virtual selection dispatches here; reservations only belong to the streaming request. */
+	poolStreams(pool: string): ProviderStreams {
+		return {
+			stream: (model, context, options) => this.request({ ...model, provider: pool }, context, options, false),
+			streamSimple: (model, context, options) => this.request({ ...model, provider: pool }, context, options, true),
+		};
+	}
+
 	stream: ProviderStreams["stream"] = (model, context, options) => this.request(model, context, options, false);
 	streamSimple: ProviderStreams["streamSimple"] = (model, context, options) =>
 		this.request(model, context, options, true);
@@ -335,8 +342,6 @@ export class PoolRouter {
 			};
 			try {
 				signal.throwIfAborted();
-				await deps.prepare?.();
-				signal.throwIfAborted();
 				const config = deps.config();
 				const pool = config.pools.find((candidate) => candidate.name === model.provider && candidate.enabled);
 				// A physical account is pinned even when it is also a member of a pool.
@@ -405,7 +410,7 @@ export class PoolRouter {
 					const targetModel =
 						!pool || (target.pool.name === model.provider && target.model === model.id)
 							? model
-							: await deps.poolModel(target.pool.name, target.model);
+							: deps.poolModel(target.pool.name, target.model);
 					if (!targetModel) continue;
 					const sourceTarget = target.pool.name === model.provider && target.model === model.id;
 					// Pi already resolved the source request, including any !command header values.

@@ -77,8 +77,6 @@ codex-pool/gpt-6-astra       # 由号池选择账号
 }
 ```
 
-继承Pi提供方的前台子代理会使用同一个号池。单独启动的Pi进程也需要加载本插件。绕过Pi提供方、直接调用外部CLI的插件则不会经过号池调度。
-
 ## 许可证
 
 采用[MIT许可证](./LICENSE)。基于[pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass)和[pi-codex-multi](https://github.com/thelastbodhisattva/pi-codex-multi)开发，保留原版权声明。

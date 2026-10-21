@@ -98,7 +98,7 @@ function fixture({ action = async () => ({}), count = 3, retries = 3, chains = [
 		}),
 		hasAuth: (provider) => tokens.has(provider),
 		model,
-		poolModel: async (pool, id) => ({ ...model(providers[0], id), provider: pool, ...poolOverrides[pool] }),
+		poolModel: (pool, id) => ({ ...model(providers[0], id), provider: pool, ...poolOverrides[pool] }),
 		headerNames: (model) => Object.keys(model.headers ?? {}),
 		auth: async (model) => ({ auth: { apiKey: tokens.get(model.provider), headers: model.headers } }),
 		order: async (_pool, members) => ({ members, ordered: false }),

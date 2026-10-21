@@ -77,8 +77,6 @@ A subagent can use the same pool model as the main conversation:
 }
 ```
 
-Foreground subagents that inherit the Pi provider use the same pool. A separately started Pi process must load this plugin as well. Plugins that call an external CLI instead of Pi's provider system are not routed through the pool.
-
 ## License
 
 [MIT](./LICENSE). Based on [pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass) and [pi-codex-multi](https://github.com/thelastbodhisattva/pi-codex-multi), with the original copyright notice retained.
